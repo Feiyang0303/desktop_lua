@@ -1,0 +1,4 @@
+PyQt6>=6.6
+# Only needed if you want to regenerate sprites with tools/process_sprites.py
+Pillow>=10.0
+numpy>=1.26
