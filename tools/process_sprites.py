@@ -26,6 +26,8 @@ def remove_chroma_key(
     transparent_threshold: float = 0.10,
     opaque_threshold: float = 0.35,
     despill: bool = True,
+    kill_dark_fringe: bool = True,
+    alpha_floor: float = 0.18,
 ) -> Image.Image:
     """Convert green chroma-key pixels to transparent.
 
@@ -34,6 +36,15 @@ def remove_chroma_key(
     well outside stay alpha=255, and a smooth ramp connects the two so edges
     stay soft. Optional despill subtracts excess green from semi-transparent
     pixels to kill the green fringe.
+
+    `kill_dark_fringe` additionally removes the soft dark/gray gradient that
+    AI generators often paint at the base of legs and paws (faux ground
+    shadows). These pixels aren't green so the chroma test keeps them, which
+    shows up as a "shadow halo" against any non-white desktop. We detect
+    semi-transparent low-saturation dark pixels and force them to zero alpha.
+
+    `alpha_floor` then snaps any remaining sub-floor alpha down to zero so
+    no faint ghost residue can leak through.
     """
     rgba = np.asarray(img.convert("RGBA")).astype(np.float32)
     r, g, b, a = rgba[..., 0], rgba[..., 1], rgba[..., 2], rgba[..., 3]
@@ -53,10 +64,28 @@ def remove_chroma_key(
     )
 
     if despill:
+        # Subtract excess green wherever green dominates red/blue, even on
+        # fully-opaque pixels. Generated sprites often paint pale cream/white
+        # fur with a tiny green tint at the silhouette edge from compositing;
+        # clamping green to the local max of red/blue removes that fringe.
         spill = np.clip(g - np.maximum(r, b), 0.0, 255.0)
-        spill_strength = (1.0 - alpha) * 0.0 + alpha * (greenness > 0.04)
-        g = g - spill * spill_strength
+        spill_mask = (greenness > 0.02).astype(np.float32)
+        g = g - spill * spill_mask
         g = np.clip(g, 0.0, 255.0)
+
+    if kill_dark_fringe:
+        # Saturation + luminance test. Real fur edges are colored (high
+        # saturation), so they survive. Painted ground shadows are gray/dark
+        # and partially transparent after chroma keying, so they get nuked.
+        max_chan = np.maximum(np.maximum(r, g), b)
+        min_chan = np.minimum(np.minimum(r, g), b)
+        saturation = (max_chan - min_chan) / (max_chan + 1e-6)
+        luminance = (r + g + b) / 3.0
+        is_shadow = (alpha < 0.90) & (saturation < 0.18) & (luminance < 200)
+        alpha = np.where(is_shadow, 0.0, alpha)
+
+    # Hard floor: anything dimmer than the floor becomes fully transparent.
+    alpha = np.where(alpha < alpha_floor, 0.0, alpha)
 
     out_a = (a / 255.0) * alpha * 255.0
     out = np.stack([r, g, b, out_a], axis=-1).clip(0, 255).astype(np.uint8)
