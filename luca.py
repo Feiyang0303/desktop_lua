@@ -22,12 +22,15 @@ import sys
 from enum import Enum, auto
 from pathlib import Path
 
+from PIL import Image as PILImage
+
 from PyQt6.QtCore import QElapsedTimer, QPointF, Qt, QTimer
 from PyQt6.QtGui import (
     QBrush,
     QColor,
     QFont,
     QGuiApplication,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
@@ -84,6 +87,75 @@ ANIMATIONS: dict[State, tuple[list[str], int]] = {
 }
 
 
+def _pil_to_qpixmap(img: PILImage.Image) -> QPixmap:
+    """Convert a PIL RGBA image to a QPixmap (with its own pixel buffer)."""
+    rgba = img.convert("RGBA")
+    data = rgba.tobytes("raw", "RGBA")
+    qimg = QImage(
+        data,
+        rgba.width,
+        rgba.height,
+        rgba.width * 4,
+        QImage.Format.Format_RGBA8888,
+    )
+    # `copy()` detaches the QImage from the (soon-to-die) Python bytes buffer.
+    return QPixmap.fromImage(qimg.copy())
+
+
+def _aligned_frames_to_pixmaps(paths: list[Path]) -> list[QPixmap]:
+    """Normalize a sequence of animation frames into a single coordinate system.
+
+    Different generated sprites have very different canvas sizes and the dog
+    sits in different spots inside each canvas, so naively swapping frames
+    every 220 ms makes Luca jump in size and position - reading as a flash.
+
+    This function:
+      1. Tight-crops each frame to its non-transparent content (the dog).
+      2. Scales every frame so its dog content has the same *height* as the
+         tallest frame, preserving aspect ratio. This eliminates the "dog
+         shrinks/grows between frames" pop.
+      3. Pastes every frame, bottom-center anchored, onto a common canvas
+         sized to fit the widest scaled frame. With identical canvas
+         dimensions, the paint code applies the exact same scale and the
+         exact same on-screen position to every frame in the sequence.
+    """
+    if len(paths) == 1:
+        # Single-frame "animations" don't need any cross-frame alignment.
+        pix = QPixmap(str(paths[0]))
+        if pix.isNull():
+            raise FileNotFoundError(f"Sprite not found: {paths[0]}")
+        return [pix]
+
+    raws = [PILImage.open(p).convert("RGBA") for p in paths]
+    bboxes = [im.getbbox() for im in raws]
+    crops: list[PILImage.Image] = []
+    for im, bbox in zip(raws, bboxes):
+        crops.append(im.crop(bbox) if bbox is not None else im)
+
+    target_h = max(c.height for c in crops)
+    scaled: list[PILImage.Image] = []
+    for c in crops:
+        if c.height == target_h:
+            scaled.append(c)
+        else:
+            scale = target_h / c.height
+            new_w = max(1, int(round(c.width * scale)))
+            scaled.append(c.resize((new_w, target_h), PILImage.Resampling.LANCZOS))
+
+    pad = 6
+    canvas_w = max(c.width for c in scaled) + pad * 2
+    canvas_h = target_h + pad * 2
+
+    pixmaps: list[QPixmap] = []
+    for c in scaled:
+        canvas = PILImage.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        x = (canvas_w - c.width) // 2
+        y = canvas_h - c.height - pad
+        canvas.paste(c, (x, y), c)
+        pixmaps.append(_pil_to_qpixmap(canvas))
+    return pixmaps
+
+
 class Luca(QWidget):
     """A draggable, animated desktop pet."""
 
@@ -96,6 +168,10 @@ class Luca(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            # Without this, macOS draws a system shadow behind the window
+            # that lags one frame behind the widget while Luca walks, which
+            # looks like a black ghost/halo trailing him across the desktop.
+            | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -165,14 +241,11 @@ class Luca(QWidget):
         style_dir = self._styles[style_name]
         sprites: dict[State, list[QPixmap]] = {}
         for state, (files, _) in ANIMATIONS.items():
-            frames: list[QPixmap] = []
-            for name in files:
-                path = style_dir / name
-                pix = QPixmap(str(path))
-                if pix.isNull():
-                    raise FileNotFoundError(f"Sprite not found: {path}")
-                frames.append(pix)
-            sprites[state] = frames
+            paths = [style_dir / name for name in files]
+            for p in paths:
+                if not p.exists():
+                    raise FileNotFoundError(f"Sprite not found: {p}")
+            sprites[state] = _aligned_frames_to_pixmaps(paths)
         self._sprites = sprites
 
     def set_style(self, style_name: str) -> None:
@@ -224,7 +297,11 @@ class Luca(QWidget):
 
     def _on_anim_tick(self) -> None:
         frames, _ = ANIMATIONS[self._state]
-        self._frame_idx = (self._frame_idx + 1) % len(frames)
+        # WALK's frame index is driven by the bob clock in `paintEvent` so
+        # the foot-plant is always phase-locked to the bounce. Other states
+        # still advance on their own timer.
+        if self._state != State.WALK:
+            self._frame_idx = (self._frame_idx + 1) % len(frames)
         self._tick += 1
         self.update()
 
@@ -260,9 +337,19 @@ class Luca(QWidget):
         self.set_state(next_state)
 
     # ----- painting -----
+    WALK_STEP_FREQ = 5.0  # radians/sec; one full step cycle is 2 frames
+
     def paintEvent(self, _event) -> None:
         frames = self._sprites[self._state]
-        pixmap = frames[self._frame_idx % len(frames)]
+        # Drive the walk frame from the bob clock so legs and bounce are
+        # always in lockstep; for every other state, honor the timer-driven
+        # frame index.
+        if self._state == State.WALK:
+            phase = (self._t() * self.WALK_STEP_FREQ / math.pi) % 2.0
+            frame_idx = 0 if phase < 1.0 else 1
+        else:
+            frame_idx = self._frame_idx % len(frames)
+        pixmap = frames[frame_idx]
         if self._facing_left:
             pixmap = pixmap.transformed(
                 QTransform().scale(-1, 1),
@@ -301,9 +388,13 @@ class Luca(QWidget):
             sy = 1.0 + math.sin(t * 1.5) * 0.010
 
         elif self._state == State.WALK:
-            # One bounce per step (matches the 220ms walk-frame swap roughly).
-            bob_y = -abs(math.sin(t * 5.0)) * 4.0
-            rotation = math.sin(t * 5.0) * 1.5
+            # One bounce per step. `sin^2` is C^1 continuous (no velocity
+            # cusp at the foot-plant), so the bob doesn't read as a jolt
+            # the way `abs(sin)` does.
+            step_freq = 5.0
+            bob_y = -(math.sin(t * step_freq) ** 2) * 4.0
+            # Tiny body sway, also continuous.
+            rotation = math.sin(t * step_freq * 0.5) * 1.2
             if self._facing_left:
                 rotation = -rotation
 
